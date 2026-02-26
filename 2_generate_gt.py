@@ -32,7 +32,7 @@ def load_rtmpose():
         from mmdet.apis import init_detector, inference_detector
         print("✅ MMPose + MMDet loaded")
         return "mmpose", None
-    except ImportError as e:
+    except (ImportError, ValueError) as e:
         print(f"[WARNING] MMPose not available: {e}")
         print("Falling back to MediaPipe...")
         return "mediapipe", None
@@ -44,11 +44,11 @@ def init_rtmpose():
 
     # RTMDet-nano for person detection
     det_config = "https://raw.githubusercontent.com/open-mmlab/mmdetection/main/configs/rtmdet/rtmdet_nano_320-8xb32_coco-person.py"
-    det_ckpt   = "https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_nano_8xb32-300e_coco/rtmdet_nano_8xb32-300e_coco_20220615_230143-f477c511.pth"
+    det_ckpt   = "https://download.open-mmlab.com/mmdetection/v3.0/rtmdet/rtmdet_nano_8xb32-300e_coco/rtmdet_nano_8xb32-300e_coco_20220615_230143-f477c511.pth"
 
     # RTMPose-x for pose estimation (highest accuracy)
     pose_config = "https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/body_2d_keypoint/rtmpose/coco/rtmpose-x_8xb256-420e_coco-256x192.py"
-    pose_ckpt   = "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-x_simcc-coco_pt-body7_420e-256x192-e2462712_20230224.pth"
+    pose_ckpt   = "https://download.open-mmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-x_simcc-coco_pt-body7_420e-256x192-e2462712_20230224.pth"
 
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,8 +101,10 @@ def run_mmpose(video_path, output_file):
             continue
 
         # Use largest bbox (closest person)
-        areas = (person_bboxes[:, 2] - person_bboxes[:, 0]) * 
-                (person_bboxes[:, 3] - person_bboxes[:, 1])
+        areas = (
+            (person_bboxes[:, 2] - person_bboxes[:, 0]) *
+            (person_bboxes[:, 3] - person_bboxes[:, 1])
+        )
         best  = person_bboxes[np.argmax(areas)]
 
         # Run pose
