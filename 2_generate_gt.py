@@ -134,40 +134,61 @@ def run_mmpose(video_path, output_file):
     return gt_array
 
 def _install_mediapipe():
-    """Try to install mediapipe, falling back to --user if access is denied."""
+    """Install mediapipe<=0.10.14 (last version with solutions.pose API).
+    Falls back to --user install if access is denied."""
     import subprocess
-    print("Installing mediapipe...")
-    # First attempt: normal install
+    # Pin to 0.10.14 — last version with mp.solutions.pose support
+    PKG = "mediapipe<=0.10.14"
+    print(f"Installing {PKG} ...")
     ret = subprocess.call(
-        [sys.executable, "-m", "pip", "install", "mediapipe", "--quiet"]
+        [sys.executable, "-m", "pip", "install", PKG, "--quiet"]
     )
     if ret != 0:
-        print("[WARNING] Normal install failed (possibly permission error). Trying --user install...")
+        print("[WARNING] Normal install failed. Trying --user install...")
         ret = subprocess.call(
-            [sys.executable, "-m", "pip", "install", "mediapipe", "--user", "--quiet"]
+            [sys.executable, "-m", "pip", "install", PKG, "--user", "--quiet"]
         )
     if ret != 0:
         raise RuntimeError(
             "Could not install mediapipe automatically.\n"
             "Please run manually in your conda env:\n"
-            "    pip install mediapipe\n"
+            "    pip install \"mediapipe<=0.10.14\"\n"
             "or with user flag:\n"
-            "    pip install mediapipe --user"
+            "    pip install \"mediapipe<=0.10.14\" --user"
         )
 
+def _check_mediapipe_version():
+    """Warn if mediapipe >= 0.10.15 is installed (solutions API removed)."""
+    try:
+        import importlib.metadata as meta
+        ver = meta.version("mediapipe")
+        parts = [int(x) for x in ver.split(".")[:3]]
+        if parts >= [0, 10, 15]:
+            print(
+                f"[WARNING] mediapipe {ver} does not support mp.solutions.pose.\n"
+                "  Run: pip install \"mediapipe<=0.10.14\" --force-reinstall"
+            )
+            return False
+    except Exception:
+        pass
+    return True
+
 def run_mediapipe_fallback(video_path, output_file):
-    """Fallback: use MediaPipe Pose if MMPose not available."""
+    """Fallback: use MediaPipe Pose (requires mediapipe<=0.10.14)."""
     try:
         import mediapipe as mp
+        if not _check_mediapipe_version():
+            raise ImportError("mediapipe version too new — solutions API removed")
     except ImportError:
         _install_mediapipe()
         try:
             import mediapipe as mp
+            _check_mediapipe_version()
         except ImportError:
             raise RuntimeError(
                 "mediapipe could not be imported even after install.\n"
                 "Please close any programs locking cv2.pyd and run:\n"
-                "    pip install mediapipe\n"
+                "    pip install \"mediapipe<=0.10.14\"\n"
                 "Then re-run this script."
             )
 
