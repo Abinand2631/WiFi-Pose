@@ -12,6 +12,7 @@ Output: data/gt/skeleton_gt.npy  shape: (N_frames, 17, 3)
 import cv2
 import numpy as np
 import os
+import sys
 import time
 from tqdm import tqdm
 
@@ -44,11 +45,11 @@ def init_rtmpose():
 
     # RTMDet-nano for person detection
     det_config = "https://raw.githubusercontent.com/open-mmlab/mmdetection/main/configs/rtmdet/rtmdet_nano_320-8xb32_coco-person.py"
-    det_ckpt   = "https://download.open-mmlab.com/mmdetection/v3.0/rtmdet/rtmdet_nano_8xb32-300e_coco/rtmdet_nano_8xb32-300e_coco_20220615_230143-f477c511.pth"
+    det_ckpt   = "https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_nano_8xb32-300e_coco/rtmdet_nano_8xb32-300e_coco_20220615_230143-f477c511.pth"
 
     # RTMPose-x for pose estimation (highest accuracy)
     pose_config = "https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/body_2d_keypoint/rtmpose/coco/rtmpose-x_8xb256-420e_coco-256x192.py"
-    pose_ckpt   = "https://download.open-mmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-x_simcc-coco_pt-body7_420e-256x192-e2462712_20230224.pth"
+    pose_ckpt   = "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-x_simcc-coco_pt-body7_420e-256x192-e2462712_20230224.pth"
 
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,14 +133,43 @@ def run_mmpose(video_path, output_file):
     print(f"\n✅ GT saved → {output_file}  shape: {gt_array.shape}")
     return gt_array
 
+def _install_mediapipe():
+    """Try to install mediapipe, falling back to --user if access is denied."""
+    import subprocess
+    print("Installing mediapipe...")
+    # First attempt: normal install
+    ret = subprocess.call(
+        [sys.executable, "-m", "pip", "install", "mediapipe", "--quiet"]
+    )
+    if ret != 0:
+        print("[WARNING] Normal install failed (possibly permission error). Trying --user install...")
+        ret = subprocess.call(
+            [sys.executable, "-m", "pip", "install", "mediapipe", "--user", "--quiet"]
+        )
+    if ret != 0:
+        raise RuntimeError(
+            "Could not install mediapipe automatically.\n"
+            "Please run manually in your conda env:\n"
+            "    pip install mediapipe\n"
+            "or with user flag:\n"
+            "    pip install mediapipe --user"
+        )
+
 def run_mediapipe_fallback(video_path, output_file):
     """Fallback: use MediaPipe Pose if MMPose not available."""
     try:
         import mediapipe as mp
     except ImportError:
-        print("Installing mediapipe...")
-        os.system("pip install mediapipe")
-        import mediapipe as mp
+        _install_mediapipe()
+        try:
+            import mediapipe as mp
+        except ImportError:
+            raise RuntimeError(
+                "mediapipe could not be imported even after install.\n"
+                "Please close any programs locking cv2.pyd and run:\n"
+                "    pip install mediapipe\n"
+                "Then re-run this script."
+            )
 
     # MediaPipe landmark indices that map to COCO 17 keypoints
     MP_TO_COCO = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
