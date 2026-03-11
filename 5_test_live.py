@@ -1,12 +1,7 @@
 """
-STEP 5 — Live Inference & Visualisation
-========================================
-Streams CSI from 2 ESP32 receivers in real-time,
-runs TEDNet 2RX, and draws predicted skeleton on screen.
-
-Controls:
-  q  — quit
-  s  — save current frame
+STEP 5 — Live CSI → Skeleton Inference (2 RX, ESP32 CSI)
+=========================================================
+Press 'q' to quit.
 """
 
 import serial
@@ -14,236 +9,276 @@ import numpy as np
 import torch
 import torch.nn as nn
 import cv2
-import threading
-import collections
-import time
-import os
 import re
-from train import TEDNet   # reuse model definition from 4_train.py
+from collections import deque
 
-# ===================== CONFIGURATION =====================
-SERIAL_PORTS = {
-    1: "COM7",   # ← update to your RX1 port
-    2: "COM3",   # ← update to your RX2 port
-}
-BAUD_RATE    = 115200
-MODEL_PATH   = os.path.join("models", "tednet_best.pth")
-CSI_MEAN     = os.path.join("data", "processed", "csi_mean.npy")
-CSI_STD      = os.path.join("data", "processed", "csi_std.npy")
+# ================= CONFIG =================
 
-WINDOW_SIZE  = 100
-N_SUB        = 128
-N_FEATURES   = 256    # RX1 + RX2
-N_JOINTS     = 17
-CSI_PATTERN  = re.compile(r'CSI_DATA,\d+,[^\"]*,"\[([^\[\]]*)\]"")
+COM_PORT_RX1 = "COM3"
+COM_PORT_RX2 = "COM7"
+BAUD_RATE = 115200
 
-DISPLAY_W    = 640
-DISPLAY_H    = 480
-SAVE_DIR     = "output_frames"
-os.makedirs(SAVE_DIR, exist_ok=True)
+WINDOW_SIZE = 100
+SUBCARRIERS = 128
+N_FEATURES = 256      # 128 RX1 + 128 RX2
+OUTPUT_DIM = 34
+
+MODEL_PATH = "models/tednet_best.pth"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {DEVICE}")
+print("Using device:", DEVICE)
 
-# ===================== COCO SKELETON =====================
-# 17 COCO keypoints:
-# 0=nose, 1=l_eye, 2=r_eye, 3=l_ear, 4=r_ear,
-# 5=l_shoulder, 6=r_shoulder, 7=l_elbow, 8=r_elbow,
-# 9=l_wrist, 10=r_wrist, 11=l_hip, 12=r_hip,
-# 13=l_knee, 14=r_knee, 15=l_ankle, 16=r_ankle
+# ================= MODEL (MATCHES TRAINING) =================
 
-SKELETON_EDGES = [
-    (0, 1), (0, 2), (1, 3), (2, 4),            # head
-    (5, 6),                                       # shoulders
-    (5, 7), (7, 9),                               # left arm
-    (6, 8), (8, 10),                              # right arm
-    (5, 11), (6, 12), (11, 12),                   # torso
-    (11, 13), (13, 15),                           # left leg
-    (12, 14), (14, 16),                           # right leg
-]
+class CNNEncoder(nn.Module):
+    def __init__(self, in_channels, d_model):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, d_model, 3, padding=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, 3, padding=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model * 2, 3, padding=1),
+            nn.BatchNorm1d(d_model * 2),
+            nn.GELU(),
+            nn.Conv1d(d_model * 2, d_model, 3, padding=1),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
 
-JOINT_COLOUR  = (0, 255, 0)        # green
-BONE_COLOUR   = (255, 100, 0)      # blue-orange
-POINT_RADIUS  = 6
-LINE_THICK    = 2
-
-
-# ===================== CSI BUFFER =====================
-
-class CSIBuffer:
-    def __init__(self, maxlen):
-        self.buf  = collections.deque(maxlen=maxlen)
-        self.lock = threading.Lock()
-
-    def push(self, row):
-        with self.lock:
-            self.buf.append(row)
-
-    def get_window(self):
-        with self.lock:
-            if len(self.buf) < self.buf.maxlen:
-                return None
-            return np.array(list(self.buf), dtype=np.float32)
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.net(x)
+        x = x.permute(0, 2, 1)
+        return x
 
 
-# ===================== SERIAL READER THREAD =====================
+class TEDNet(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-def csi_reader_thread(dev_id, port, buffer, stop_event):
+        d_model = 128
+        n_heads = 8
+        n_layers = 4
+        dim_ff = 512
+        dropout = 0.1
+
+        self.cnn_encoder = CNNEncoder(N_FEATURES, d_model)
+
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, WINDOW_SIZE, d_model) * 0.02
+        )
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            enc_layer,
+            num_layers=n_layers
+        )
+
+        self.regressor = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, OUTPUT_DIM),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        x = self.cnn_encoder(x)
+        x = x + self.pos_embed
+        x = self.transformer(x)
+        x = x.mean(dim=1)
+        x = self.regressor(x)
+        return x
+
+
+# ================= LOAD MODEL =================
+
+print("Loading model...")
+model = TEDNet().to(DEVICE)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+model.eval()
+print("Model loaded.")
+
+# ================= CSI PARSER =================
+
+CSI_PATTERN = re.compile(r'\[([^\]]+)\]')
+
+def parse_csi(line):
+    if "CSI_DATA" not in line:
+        return None
+
+    match = CSI_PATTERN.search(line)
+    if not match:
+        return None
+
     try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=1)
-        print(f"[RX{dev_id}] Connected: {port}")
-    except Exception as e:
-        print(f"[RX{dev_id}] FAILED to open {port}: {e}")
-        stop_event.set()
-        return
+        csi_str = match.group(1)
+        values = np.fromstring(csi_str, sep=',', dtype=np.float32)
 
-    while not stop_event.is_set():
-        try:
-            if ser.in_waiting:
-                line = ser.readline().decode("utf-8", errors="ignore").rstrip("\x00")
-                if "CSI_DATA" not in line:
-                    continue
-                match = CSI_PATTERN.search(line)
-                if not match:
-                    continue
-                clean = re.sub(r"[^\d,\-]", "", match.group(1).strip())
-                vals  = [int(x) for x in clean.split(",") if x]
-                if len(vals) < 2 * N_SUB:
-                    continue
-                # Compute amplitude from I/Q
-                I   = np.array(vals[0:2*N_SUB:2], dtype=np.float32)
-                Q   = np.array(vals[1:2*N_SUB:2], dtype=np.float32)
-                amp = np.sqrt(I**2 + Q**2)
-                buffer.push(amp)
-            else:
-                time.sleep(0.001)
-        except Exception as ex:
-            print(f"[RX{dev_id}] Error: {ex}")
-            break
+        # Your firmware sends 384 values
+        if len(values) < 384:
+            return None
 
-    ser.close()
+        # Convert real/imag pairs → magnitude
+        real = values[0::2][:SUBCARRIERS]
+        imag = values[1::2][:SUBCARRIERS]
+        magnitude = np.sqrt(real**2 + imag**2)
+
+        return magnitude.astype(np.float32)
+
+    except:
+        return None
 
 
-# ===================== LOAD MODEL =====================
+# ================= SERIAL =================
 
-def load_model(path):
-    model = TEDNet().to(DEVICE)
-    model.load_state_dict(torch.load(path, map_location=DEVICE))
-    model.eval()
-    print(f"✅ Model loaded: {path}")
-    return model
+ser1 = serial.Serial(COM_PORT_RX1, BAUD_RATE, timeout=1)
+ser2 = serial.Serial(COM_PORT_RX2, BAUD_RATE, timeout=1)
 
+print("[RX1] Connected:", COM_PORT_RX1)
+print("[RX2] Connected:", COM_PORT_RX2)
+print("Waiting for CSI buffers to fill...")
 
-# ===================== INFERENCE =====================
+buffer_rx1 = deque(maxlen=WINDOW_SIZE)
+buffer_rx2 = deque(maxlen=WINDOW_SIZE)
 
-def infer(model, rx1_window, rx2_window, mean, std):
-    """
-    rx1_window, rx2_window : (WINDOW_SIZE, N_SUB)
-    Returns: keypoints (17, 2) in pixel coords for DISPLAY_W × DISPLAY_H
-    """
-    x = np.concatenate([rx1_window, rx2_window], axis=1)  # (W, 256)
+started = False
+
+# ================= MAIN LOOP =================
+
+while True:
+
+    # RX1
+    line1 = ser1.readline().decode(errors="ignore")
+    csi1 = parse_csi(line1)
+    if csi1 is not None:
+        buffer_rx1.append(csi1)
+
+    # RX2
+    line2 = ser2.readline().decode(errors="ignore")
+    csi2 = parse_csi(line2)
+    if csi2 is not None:
+        buffer_rx2.append(csi2)
+
+    print(f"\rRX1: {len(buffer_rx1)}/{WINDOW_SIZE}   "
+          f"RX2: {len(buffer_rx2)}/{WINDOW_SIZE}", end="")
+
+    if len(buffer_rx1) < WINDOW_SIZE or len(buffer_rx2) < WINDOW_SIZE:
+        continue
+
+    if not started:
+        print("\nBuffers full. Starting inference...\n")
+        started = True
+
+    rx1_arr = np.array(buffer_rx1)
+    rx2_arr = np.array(buffer_rx2)
+
+    x = np.concatenate([rx1_arr, rx2_arr], axis=1)  # (100,256)
+
+    # Normalization (same style as training)
+    mean = x.mean()
+    std = x.std() + 1e-6
     x = (x - mean) / std
-    x_t = torch.tensor(x[np.newaxis], dtype=torch.float32).to(DEVICE)  # (1, W, 256)
+
+    x_t = torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        pred = model(x_t).cpu().numpy()[0]   # (34,)
+        pred = model(x_t).cpu().numpy()[0]
 
+    # ================= DRAW SKELETON & RECOGNISE ACTION =================
     kps = pred.reshape(17, 2)
-    kps[:, 0] *= DISPLAY_W
-    kps[:, 1] *= DISPLAY_H
-    return kps.astype(int)
+    
+    # Define COCO connections (0: Nose, 1: LEye, 2: REye, 3: LEar, 4: REar, 
+    # 5: LShoulder, 6: RShoulder, 7: LElbow, 8: RElbow, 9: LWrist, 10: RWrist,
+    # 11: LHip, 12: RHip, 13: LKnee, 14: RKnee, 15: LAnkle, 16: RAnkle)
+    SKELETON = [
+        (15, 13), (13, 11), (16, 14), (14, 12),  # Legs
+        (11, 12), (5, 11), (6, 12), (5, 6),      # Torso/Pelvis
+        (5, 7), (7, 9), (6, 8), (8, 10),         # Arms
+        (1, 2), (0, 1), (0, 2), (1, 3), (2, 4),  # Face
+        (3, 5), (4, 6)                           # Neck/Shoulders
+    ]
+
+    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Convert normalized (0..1) to pixel coords
+    kps_pixels = []
+    for x_norm, y_norm in kps:
+        x_pix = int(np.clip(x_norm, 0, 1) * 640)
+        y_pix = int(np.clip(y_norm, 0, 1) * 480)
+        kps_pixels.append((x_pix, y_pix))
+
+    # Draw Connections (Lines)
+    for p1, p2 in SKELETON:
+        pt1 = kps_pixels[p1]
+        pt2 = kps_pixels[p2]
+        
+        # Don't draw if the point is predicted exactly at (0,0) which means missing GT
+        if pt1 == (0,0) or pt2 == (0,0):
+             continue
+
+        cv2.line(canvas, pt1, pt2, (255, 100, 0), 3) # Blue skeleton lines
+
+    # Draw Joints (Dots)
+    for x_pix, y_pix in kps_pixels:
+        if (x_pix, y_pix) == (0,0):
+            continue
+        cv2.circle(canvas, (x_pix, y_pix), 5, (0, 255, 0), -1) # Green dots
+
+    # Simple Heuristic Action Recognition
+    action = "Unknown"
+    
+    try:
+        # Get coordinates for heuristics
+        # Note: Y-axis goes DOWN in OpenCV (0 is top of screen, 480 is bottom)
+        left_hip_y, right_hip_y = kps_pixels[11][1], kps_pixels[12][1]
+        left_knee_y, right_knee_y = kps_pixels[13][1], kps_pixels[14][1]
+        left_ankle_y, right_ankle_y = kps_pixels[15][1], kps_pixels[16][1]
+        left_ankle_x, right_ankle_x = kps_pixels[15][0], kps_pixels[16][0]
+
+        avg_hip_y = (left_hip_y + right_hip_y) / 2
+        avg_knee_y = (left_knee_y + right_knee_y) / 2
+        
+        # Distance between ankles for walking heuristics
+        ankle_dist_x = abs(left_ankle_x - right_ankle_x)
+
+        # 1. Check if sitting (hips are close to knees vertically)
+        if abs(avg_hip_y - avg_knee_y) < 40: # threshold in pixels
+            action = "Sitting"
+        
+        # 2. Check if walking (legs wide apart horizontally)
+        elif ankle_dist_x > 90:
+            action = "Walking"
+            
+        # 3. Otherwise standing (hips significantly above knees and legs together)
+        elif avg_hip_y < avg_knee_y - 40: 
+            action = "Standing"
+
+    except Exception:
+        pass # If points are missing or out of bounds, keep "Unknown"
+
+    cv2.putText(canvas, f"Action: {action}", (20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
 
 
-# ===================== DRAW SKELETON =====================
+    cv2.imshow("WiFi-Pose Live Inference (q to quit)", canvas)
 
-def draw_skeleton(frame, keypoints):
-    for (a, b) in SKELETON_EDGES:
-        pt1 = tuple(keypoints[a])
-        pt2 = tuple(keypoints[b])
-        cv2.line(frame, pt1, pt2, BONE_COLOUR, LINE_THICK)
-    for kp in keypoints:
-        cv2.circle(frame, tuple(kp), POINT_RADIUS, JOINT_COLOUR, -1)
-    return frame
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-
-# ===================== MAIN =====================
-
-if __name__ == "__main__":
-    print("=" * 55)
-    print("WiFi-Pose — Live Inference")
-    print("=" * 55)
-
-    # Load normalisation stats
-    mean = np.load(CSI_MEAN) if os.path.exists(CSI_MEAN) else 0.0
-    std  = np.load(CSI_STD)  if os.path.exists(CSI_STD)  else 1.0
-
-    # Load model
-    model = load_model(MODEL_PATH)
-
-    # CSI buffers (one per receiver)
-    buf1 = CSIBuffer(maxlen=WINDOW_SIZE)
-    buf2 = CSIBuffer(maxlen=WINDOW_SIZE)
-
-    stop_event = threading.Event()
-
-    # Start reader threads
-    t1 = threading.Thread(target=csi_reader_thread, args=(1, SERIAL_PORTS[1], buf1, stop_event), daemon=True)
-    t2 = threading.Thread(target=csi_reader_thread, args=(2, SERIAL_PORTS[2], buf2, stop_event), daemon=True)
-    t1.start(); t2.start()
-
-    print("Waiting for CSI buffers to fill...")
-    frame_count = 0
-    fps_time    = time.time()
-
-    while not stop_event.is_set():
-        win1 = buf1.get_window()
-        win2 = buf2.get_window()
-
-        # Create blank canvas
-        canvas = np.zeros((DISPLAY_H, DISPLAY_W, 3), dtype=np.uint8)
-
-        if win1 is None or win2 is None:
-            # Not enough data yet
-            cv2.putText(canvas, "Collecting CSI data...",
-                        (20, DISPLAY_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0, (255, 255, 255), 2)
-        else:
-            try:
-                kps = infer(model, win1, win2, mean, std)
-                canvas = draw_skeleton(canvas, kps)
-
-                # FPS counter
-                frame_count += 1
-                elapsed = time.time() - fps_time
-                if elapsed >= 1.0:
-                    fps = frame_count / elapsed
-                    frame_count = 0
-                    fps_time    = time.time()
-                else:
-                    fps = frame_count / max(elapsed, 1e-6)
-
-                cv2.putText(canvas, f"FPS: {fps:.1f}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8, (200, 200, 200), 2)
-                cv2.putText(canvas, "WiFi-Pose Live",
-                            (10, DISPLAY_H - 15), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (100, 200, 255), 1)
-            except Exception as ex:
-                cv2.putText(canvas, f"Inference error: {ex}",
-                            (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6, (0, 0, 255), 1)
-
-        cv2.imshow("WiFi-Pose — Live Inference (q to quit)", canvas)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q"):
-            print("Quitting...")
-            stop_event.set()
-        elif key == ord("s"):
-            fname = os.path.join(SAVE_DIR, f"frame_{int(time.time())}.png")
-            cv2.imwrite(fname, canvas)
-            print(f"Saved: {fname}")
-
-    cv2.destroyAllWindows()
-    stop_event.set()
-    print("Done.")
+ser1.close()
+ser2.close()
+cv2.destroyAllWindows()
+print("\nDone.")
